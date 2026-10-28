@@ -1,0 +1,59 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/ai.mjs\" context \"$CLAUDE_PROJECT_DIR\""
+          },
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/ai.mjs\" wake \"$CLAUDE_PROJECT_DIR\"",
+            "async": true,
+            "asyncRewake": true,
+            "timeout": 604800
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/ai.mjs\" wake \"$CLAUDE_PROJECT_DIR\"",
+            "async": true,
+            "asyncRewake": true,
+            "timeout": 604800
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/ai.mjs\" wake \"$CLAUDE_PROJECT_DIR\"",
+            "async": true,
+            "asyncRewake": true,
+            "timeout": 604800
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Read|Edit|Write|NotebookEdit|Grep|Glob|Bash|WebFetch|WebSearch|Task|Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/ai.mjs\" progress",
+            "async": true
+          }
+        ]
+      }
+    ]
+  }
+}

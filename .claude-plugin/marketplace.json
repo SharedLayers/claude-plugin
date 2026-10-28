@@ -1,0 +1,15 @@
+{
+  "name": "sharedlayers",
+  "owner": {
+    "name": "SharedLayers",
+    "url": "https://sharedlayers.com"
+  },
+  "description": "SharedLayers for Claude Code: comments on your local app, sent to Claude as you post them.",
+  "plugins": [
+    {
+      "name": "sharedlayers",
+      "description": "Comments you leave on your local app with the SharedLayers extension go straight to Claude Code.",
+      "source": "./plugins/sharedlayers"
+    }
+  ]
+}

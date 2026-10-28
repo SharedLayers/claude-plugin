@@ -1,0 +1,7 @@
+{
+  "name": "sharedlayers",
+  "version": "0.2.7",
+  "description": "Comments you leave on your local app with the SharedLayers extension go straight to Claude Code, which makes the change and answers in the thread.",
+  "author": { "name": "SharedLayers", "url": "https://sharedlayers.com" },
+  "homepage": "https://sharedlayers.com"
+}
