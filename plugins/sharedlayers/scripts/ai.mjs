@@ -90,8 +90,8 @@ async function readJson(path) {
   }
 }
 
-/** Every AI layer in the folder, with its file's id. */
-async function aiLayers() {
+/** Every layer in the folder, with its file's id. */
+async function allLayers() {
   let names = [];
   try {
     names = await fs.readdir(LAYERS);
@@ -102,11 +102,16 @@ async function aiLayers() {
   for (const name of names.sort()) {
     if (!name.endsWith('.json')) continue;
     const layer = await readJson(join(LAYERS, name));
-    if (layer && layer.workflow_type === 'ai' && Array.isArray(layer.comments)) {
+    if (layer && Array.isArray(layer.comments)) {
       layers.push({ id: name.slice(0, -'.json'.length), layer });
     }
   }
   return layers;
+}
+
+/** Every AI layer in the folder, with its file's id. */
+async function aiLayers() {
+  return (await allLayers()).filter(({ layer }) => layer.workflow_type === 'ai');
 }
 
 /** Writes a file whole: a new one beside it, renamed over it. */
@@ -676,19 +681,33 @@ async function hold({ waiting = null } = {}) {
 /**
  * The plugin's SessionStart hook: tells Claude, before anything else, that
  * this project takes requests from the browser, and where the instructions
- * are. Nothing at all in a project without an AI layer.
+ * are; and that the other layers' open comments are in the folder, which
+ * the connector never sees and a search skips (it ignores itself in git).
+ * Nothing at all in a project with neither.
  */
 async function context(project) {
   useProject(project || process.env.CLAUDE_PROJECT_DIR || process.cwd());
-  if ((await aiLayers()).length === 0) return;
+  const layers = await allLayers();
+  const ai = layers.some(({ layer }) => layer.workflow_type === 'ai');
+  const open = layers
+    .filter(({ layer }) => layer.workflow_type !== 'ai')
+    .reduce((n, { layer }) => n + layer.comments.filter((c) => c && !c.is_resolved).length, 0);
+  const lines = [];
+  if (ai) {
+    lines.push('This project has a SharedLayers AI layer: the person comments on the running app in their browser, '
+      + 'and each comment reaches you as a line from the SharedLayers plugin ("New request <id> …"). You are listening '
+      + 'already; do not start another watch. Handle each request as .sharedlayers/AI.md says: '
+      + 'node .sharedlayers/ai.mjs working <id>, then show <id>, make the change, then done <id> "<what changed>" or ask <id> "<question>".');
+  }
+  if (open) {
+    lines.push(`This project has ${open} open SharedLayers comment${open === 1 ? '' : 's'} that people left on the app while it ran locally, `
+      + 'kept in .sharedlayers/layers/ (one JSON file a layer; .sharedlayers/README.md says how to read and close them). '
+      + 'The SharedLayers connector does not list them, and the folder ignores itself in git, so a search skips it. '
+      + 'When the person asks about comments, feedback or review notes on the app, read them there.');
+  }
+  if (!lines.length) return;
   process.stdout.write(`${JSON.stringify({
-    hookSpecificOutput: {
-      hookEventName: 'SessionStart',
-      additionalContext: 'This project has a SharedLayers AI layer: the person comments on the running app in their browser, '
-        + 'and each comment reaches you as a line from the SharedLayers plugin ("New request <id> …"). You are listening '
-        + 'already; do not start another watch. Handle each request as .sharedlayers/AI.md says: '
-        + 'node .sharedlayers/ai.mjs working <id>, then show <id>, make the change, then done <id> "<what changed>" or ask <id> "<question>".',
-    },
+    hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: lines.join('\n\n') },
   })}\n`);
 }
 
