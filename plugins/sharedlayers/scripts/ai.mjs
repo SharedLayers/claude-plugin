@@ -447,6 +447,35 @@ function onStop(cleanup) {
   process.on('exit', releaseLock);
 }
 
+/**
+ * The Claude Code plugin's mark in the project's .sharedlayers, left by its
+ * listener and kept when Claude Code closes, as agent.json is not: the bar's
+ * setup reads it to tell the plugin is installed, and then only says to open
+ * Claude Code, not how to install it. agent.json says it is listening now;
+ * this, that it has run here.
+ */
+let marked = false;
+async function markPlugin() {
+  if (marked) return;
+  // Only where there is a folder already: none is made for this.
+  try {
+    await fs.stat(ROOT);
+  } catch {
+    return;
+  }
+  marked = true;
+  let version = null;
+  try {
+    const manifest = join(dirname(fileURLToPath(import.meta.url)), '..', '.claude-plugin', 'plugin.json');
+    version = JSON.parse(readFileSync(manifest, 'utf8')).version ?? null;
+  } catch { /* not run from the plugin */ }
+  await fs.writeFile(join(ROOT, 'plugin.json'), `${JSON.stringify({
+    plugin: 'sharedlayers',
+    version,
+    last_run: new Date().toISOString(),
+  }, null, 2)}\n`).catch(() => { marked = false; });
+}
+
 async function dropBeat() {
   const held = await readJson(AGENT);
   if (held?.pid === process.pid) await fs.rm(AGENT, { force: true });
@@ -674,6 +703,9 @@ async function serve(project, { owner = null, session = null } = {}) {
       if (readPid(sessionFile(session, 'serve')) === process.pid) rmSync(sessionFile(session, 'serve'), { force: true });
     });
   }
+  // The plugin's mark, as soon as the project has its folder (markPlugin).
+  void markPlugin();
+  setInterval(() => void markPlugin(), BEAT_MS);
   await hold();
   await watch({
     hint: '(SharedLayers: how to handle it is in .sharedlayers/AI.md)',
