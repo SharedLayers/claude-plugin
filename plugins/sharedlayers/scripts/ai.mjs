@@ -27,7 +27,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
-import { promises as fs, appendFileSync, openSync, closeSync, writeSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { promises as fs, appendFileSync, openSync, closeSync, writeSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import { basename, dirname, join, sep } from 'node:path';
@@ -68,6 +68,15 @@ const BEAT_MS = 3000;
 /** How often a session's listener checks its Claude Code is still there, and its wake hook looks for lines. */
 const OWNER_LOOK_MS = Number(process.env.SHAREDLAYERS_OWNER_MS) || 5000;
 const WAKE_LOOK_MS = Number(process.env.SHAREDLAYERS_WAKE_MS) || 500;
+/**
+ * A pid file its process has not touched for this long names a process that
+ * is gone, whatever that pid is now: Windows hands pids out again within
+ * minutes, and a listener ended there is ended outright, files and all. The
+ * lock and a session's listener file are touched every beat; a waiting hook's
+ * file every look, so it goes stale sooner.
+ */
+const STALE_MS = 20_000;
+const WAITER_STALE_MS = Math.max(5000, WAKE_LOOK_MS * 10);
 /**
  * The page picture and attached images are saved a moment after the comment.
  * A new request is passed on once its picture is there, or after this long
@@ -256,17 +265,41 @@ function alive(pid) {
   }
 }
 
-/** The pid holding the project's lock, other than this one, or null. */
-function lockHolder() {
+/** How long ago a file was written or touched, in ms; Infinity when it is not there. */
+function age(path) {
   try {
-    const pid = Number(readFileSync(lockPath(), 'utf8'));
-    return pid && pid !== process.pid && alive(pid) ? pid : null;
+    return Date.now() - statSync(path).mtimeMs;
   } catch {
-    return null;
+    return Infinity;
   }
 }
 
-/** Takes the lock when nobody alive holds it. */
+/** Keeps a pid file of this process fresh (STALE_MS), while it still names this process. */
+function keepFresh(path, every = BEAT_MS) {
+  return setInterval(() => {
+    if (readPid(path) !== process.pid) return;
+    const now = new Date();
+    try {
+      utimesSync(path, now, now);
+    } catch { /* gone: nothing to keep */ }
+  }, every);
+}
+
+/** The pid a pid file names, while that process is alive and keeps the file fresh; else 0. */
+function liveHolder(path, within = STALE_MS) {
+  const pid = readPid(path);
+  return pid && alive(pid) && age(path) < within ? pid : 0;
+}
+
+/** The pid holding the project's lock, other than this one, or null. */
+function lockHolder() {
+  const pid = liveHolder(lockPath());
+  return pid && pid !== process.pid ? pid : null;
+}
+
+let keepingLock = null;
+
+/** Takes the lock when nobody alive holds it, and keeps it fresh while this runs. */
 function takeLock() {
   if (lockHolder()) return false;
   try {
@@ -277,7 +310,9 @@ function takeLock() {
     return false;
   }
   // Another process may have written in the same moment: the last write wins.
-  return !lockHolder();
+  if (lockHolder()) return false;
+  keepingLock ??= keepFresh(lockPath());
+  return true;
 }
 
 function releaseLock() {
@@ -337,6 +372,67 @@ async function beat() {
     started_at: mine ? held.started_at : now,
     seen_at: now,
   }, null, 2)}\n`).catch(() => {});
+}
+
+/** Shells a hook's command may run through on its way from Claude Code. */
+const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'fish', 'cmd', 'powershell', 'pwsh']);
+
+/**
+ * Every process's parent and name: from ps, or on Windows from PowerShell
+ * (wmic is gone from current Windows). Null when neither answers.
+ */
+function processTable() {
+  const [file, args] = process.platform === 'win32'
+    ? ['powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId) $($_.Name)" }']]
+    : ['ps', ['-A', '-o', 'pid=,ppid=,comm=']];
+  return new Promise((resolve) => {
+    execFile(file, args, { timeout: 20_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true }, (err, out) => {
+      if (err && !out) return resolve(null);
+      const table = new Map();
+      for (const line of String(out).split(/\r?\n/)) {
+        const m = /^\s*(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line);
+        if (!m) continue;
+        const name = m[3].split(/[\\/]/).pop().replace(/^-/, '').replace(/\.exe$/i, '').toLowerCase();
+        table.set(Number(m[1]), { ppid: Number(m[2]), name });
+      }
+      resolve(table.size ? table : null);
+    });
+  });
+}
+
+/**
+ * The Claude Code process a hook belongs to: the first process above any
+ * shells. On a Mac or Linux the shell running a hook's command hands its
+ * process over to node, so the hook's parent is Claude Code itself. On
+ * Windows it cannot: the shell (Git Bash or PowerShell) stays in between and
+ * ends with the hook, which ended the session's listener with each request
+ * it woke Claude for, and the bar said Connect while Claude worked
+ * (2026-10-30). The hook's own parent when the table cannot be had.
+ */
+async function sessionOwner(pid = process.ppid) {
+  const table = await processTable();
+  let at = pid;
+  for (let i = 0; table && i < 8; i++) {
+    const p = table.get(at);
+    if (!p || !SHELLS.has(p.name) || !(p.ppid > 1)) break;
+    at = p.ppid;
+  }
+  return at;
+}
+
+let stopping = false;
+
+/**
+ * Ends this process as a stop signal would, its cleanup and all. A signal
+ * sent to itself would do that on a Mac, but on Windows it ends the process
+ * outright, leaving its lock and files behind.
+ */
+function stopNow() {
+  if (stopping) return;
+  stopping = true;
+  if (process.listenerCount('SIGTERM')) process.emit('SIGTERM', 'SIGTERM');
+  else process.exit(0);
 }
 
 function onStop(cleanup) {
@@ -565,11 +661,14 @@ async function serve(project, { owner = null, session = null } = {}) {
   useProject(project || process.env.SHAREDLAYERS_PROJECT || process.cwd());
   if (owner) {
     setInterval(() => {
-      if (!alive(owner)) process.kill(process.pid, 'SIGTERM');
+      if (!alive(owner)) stopNow();
     }, OWNER_LOOK_MS);
   }
   const queue = session ? sessionFile(session, 'queue') : null;
   if (session) {
+    // The session's wake hook starts another listener only when this one is
+    // gone from it: alive, and its file fresh (liveHolder).
+    keepFresh(sessionFile(session, 'serve'));
     process.on('exit', () => {
       for (const kind of ['queue', 'offset']) rmSync(sessionFile(session, kind), { force: true });
       if (readPid(sessionFile(session, 'serve')) === process.pid) rmSync(sessionFile(session, 'serve'), { force: true });
@@ -612,10 +711,11 @@ async function wake(project) {
   } catch { /* no input: by hand */ }
   useProject(project || process.env.CLAUDE_PROJECT_DIR || data.cwd || process.cwd());
   const session = String(data.session_id || 'session').replace(/[^\w-]/g, '').slice(0, 64) || 'session';
-  // A hook's parent is the Claude Code process of its session.
-  const owner = process.ppid;
+  // The Claude Code process of its session: the hook's parent, or above the
+  // shell that ran it on Windows.
+  const owner = await sessionOwner();
 
-  if (!alive(readPid(sessionFile(session, 'serve')))) {
+  if (!liveHolder(sessionFile(session, 'serve'))) {
     const listener = spawn(process.execPath, [fileURLToPath(import.meta.url), 'serve', PROJECT, '--owner', String(owner), '--session', session], {
       detached: true,
       stdio: 'ignore',
@@ -625,8 +725,9 @@ async function wake(project) {
   }
 
   const waiter = sessionFile(session, 'waiter');
-  if (alive(readPid(waiter))) return;
+  if (liveHolder(waiter, WAITER_STALE_MS)) return;
   writeFileSync(waiter, String(process.pid));
+  keepFresh(waiter, WAKE_LOOK_MS);
   const queue = sessionFile(session, 'queue');
   const offsetFile = sessionFile(session, 'offset');
   for (;;) {
