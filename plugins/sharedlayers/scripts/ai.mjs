@@ -541,41 +541,78 @@ function inFolder(rel) {
   return join(PROJECT, ...parts);
 }
 
-/** The local ports served by programs started in this project: its dev server. */
-let servedCache = { at: 0, ports: [] };
-function servedPorts() {
-  if (process.env.SHAREDLAYERS_SERVES !== undefined) {
-    return Promise.resolve(process.env.SHAREDLAYERS_SERVES.split(',').map(Number).filter(Boolean));
-  }
-  if (Date.now() - servedCache.at < 15_000 || process.platform === 'win32') return Promise.resolve(servedCache.ports);
+/**
+ * Every local port a program listens on, with the folders those programs run
+ * in (lsof). Null where that cannot be told: Windows, or no lsof. Looked at
+ * again once older than `maxAge`; lookups at the same time share one look.
+ */
+let listenCache = { at: 0, folders: null, pending: null };
+function listening(maxAge) {
+  if (process.platform === 'win32') return Promise.resolve(null);
+  if (listenCache.at && Date.now() - listenCache.at < maxAge) return Promise.resolve(listenCache.folders);
+  if (listenCache.pending) return listenCache.pending;
   const run = (args) => new Promise((resolve) => {
-    execFile('lsof', args, { timeout: 3000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => resolve(err && !out ? '' : String(out)));
+    execFile('lsof', args, { timeout: 3000, maxBuffer: 4 * 1024 * 1024 }, (err, out) => resolve(err && !out ? null : String(out)));
   });
-  return (async () => {
-    const listening = await run(['-nP', '-iTCP', '-sTCP:LISTEN', '-Fpn']);
+  listenCache.pending = (async () => {
+    const sockets = await run(['-nP', '-iTCP', '-sTCP:LISTEN', '-Fpn']);
+    if (sockets === null) return null;
     const portsByPid = new Map();
     let pid = 0;
-    for (const line of listening.split('\n')) {
+    for (const line of sockets.split('\n')) {
       if (line.startsWith('p')) pid = Number(line.slice(1));
       else if (line.startsWith('n') && pid !== process.pid) {
         const port = Number(line.slice(line.lastIndexOf(':') + 1));
         if (port) portsByPid.set(pid, [...(portsByPid.get(pid) || []), port]);
       }
     }
-    const ports = new Set();
+    const folders = new Map();
     if (portsByPid.size) {
       const cwds = await run(['-a', '-p', [...portsByPid.keys()].join(','), '-d', 'cwd', '-Fpn']);
-      for (const line of cwds.split('\n')) {
+      for (const line of (cwds || '').split('\n')) {
         if (line.startsWith('p')) pid = Number(line.slice(1));
         else if (line.startsWith('n')) {
           const cwd = line.slice(1);
-          if (cwd === PROJECT || cwd.startsWith(PROJECT + sep)) for (const port of portsByPid.get(pid) || []) ports.add(port);
+          for (const port of portsByPid.get(pid) || []) {
+            const at = folders.get(port) || [];
+            if (!at.includes(cwd)) folders.set(port, [...at, cwd].sort());
+          }
         }
       }
     }
-    servedCache = { at: Date.now(), ports: [...ports].sort((a, b) => a - b) };
-    return servedCache.ports;
-  })();
+    return folders;
+  })().then((folders) => {
+    listenCache = { at: Date.now(), folders, pending: null };
+    return folders;
+  }, () => {
+    listenCache = { at: Date.now(), folders: null, pending: null };
+    return null;
+  });
+  return listenCache.pending;
+}
+
+const inProject = (dir) => dir === PROJECT || dir.startsWith(PROJECT + sep);
+
+/** The local ports served by programs started in this project: its dev server. */
+async function servedPorts() {
+  if (process.env.SHAREDLAYERS_SERVES !== undefined) {
+    return process.env.SHAREDLAYERS_SERVES.split(',').map(Number).filter(Boolean);
+  }
+  const folders = await listening(15_000);
+  if (!folders) return [];
+  return [...folders].filter(([, dirs]) => dirs.some(inProject)).map(([port]) => port).sort((a, b) => a - b);
+}
+
+/**
+ * The folders of the programs serving `port`, the page the extension asks
+ * for: whose app it is, so a project this address was paired with before is
+ * not taken for it once another app took the port. Looked at freshly, as an
+ * app may have just changed. Undefined when that cannot be told.
+ */
+async function portFolders(port) {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return undefined;
+  const folders = await listening(5_000);
+  return folders ? folders.get(port) || [] : undefined;
 }
 
 function send(res, status, body, headers = {}) {
@@ -619,6 +656,8 @@ function handler() {
           project: basename(PROJECT),
           path: PROJECT,
           serves: await servedPorts(),
+          // Asked with ?port= by the extension for the page it is on.
+          portFolders: url.searchParams.has('port') ? await portFolders(Number(url.searchParams.get('port'))) : undefined,
         });
       }
       if (!url.pathname.startsWith('/fs/')) return send(res, 404, { error: 'Not found' });
