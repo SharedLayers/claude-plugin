@@ -19,7 +19,12 @@ More at [sharedlayers.com/docs/ai-layers](https://sharedlayers.com/docs/ai-layer
   until there is a request, then wakes Claude with one line per request or
   reply (an `asyncRewake` hook, so it works while Claude is idle, in the
   terminal and in the desktop app). After each of Claude's turns, a Stop hook
-  starts the next wait.
+  starts the next wait. It keeps going while the session sits idle and while
+  the computer sleeps.
+- **Other worktrees too**: when the app you comment on runs from another git
+  worktree of the project, one with an AI layer of its own, the listener
+  listens there as well, and its lines say which folder the request is in. A
+  session opened in that worktree takes it over.
 - **The extension reaches the project through it**, on 127.0.0.1 at a port from
   47820 to 47839, so the browser never asks for the project folder. Only the
   SharedLayers extension is let in.

@@ -64,7 +64,7 @@ function useProject(project) {
 let VIA = process.env.SHAREDLAYERS_VIA || (process.env.CODEX_SANDBOX ? 'Codex' : 'Claude');
 
 const LOOK_MS = Number(process.env.SHAREDLAYERS_LOOK_MS) || 1000;
-const BEAT_MS = 3000;
+const BEAT_MS = Number(process.env.SHAREDLAYERS_BEAT_MS) || 3000;
 /** How often a session's listener checks its Claude Code is still there, and its wake hook looks for lines. */
 const OWNER_LOOK_MS = Number(process.env.SHAREDLAYERS_OWNER_MS) || 5000;
 const WAKE_LOOK_MS = Number(process.env.SHAREDLAYERS_WAKE_MS) || 500;
@@ -75,8 +75,10 @@ const WAKE_LOOK_MS = Number(process.env.SHAREDLAYERS_WAKE_MS) || 500;
  * lock and a session's listener file are touched every beat; a waiting hook's
  * file every look, so it goes stale sooner.
  */
-const STALE_MS = 20_000;
+const STALE_MS = Number(process.env.SHAREDLAYERS_STALE_MS) || 20_000;
 const WAITER_STALE_MS = Math.max(5000, WAKE_LOOK_MS * 10);
+/** How often a session's listener looks for the project's other worktrees with an AI layer. */
+const FOLLOW_MS = Number(process.env.SHAREDLAYERS_FOLLOW_MS) || 15_000;
 /**
  * The page picture and attached images are saved a moment after the comment.
  * A new request is passed on once its picture is there, or after this long
@@ -228,12 +230,17 @@ function settled(comment, now = Date.now()) {
  * process passing its requests on. Two Claude Code sessions in one project, or
  * the plugin and a hand-started listen, would otherwise both take every request.
  */
-function projectKey() {
-  return createHash('sha1').update(PROJECT).digest('hex').slice(0, 16);
+function projectKey(project = PROJECT) {
+  return createHash('sha1').update(project).digest('hex').slice(0, 16);
 }
 
 function lockPath() {
-  return join(os.tmpdir(), `sharedlayers-${projectKey()}.lock`);
+  return lockPathOf(PROJECT);
+}
+
+/** Another folder's lock (followWorktrees). */
+function lockPathOf(project) {
+  return join(os.tmpdir(), `sharedlayers-${projectKey(project)}.lock`);
 }
 
 /**
@@ -291,6 +298,36 @@ function liveHolder(path, within = STALE_MS) {
   return pid && alive(pid) && age(path) < within ? pid : 0;
 }
 
+function touchedAt(path) {
+  try {
+    return statSync(path).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * liveHolder, for deciding that a holder is gone. A file not touched for a
+ * while may name a process that only slept with the rest of the computer: a
+ * Mac's timers stop while it sleeps (Power Nap wakes it every quarter of an
+ * hour or so) and its clock does not, so for a moment after every wake each
+ * holder's file looks stale, until its next beat. A stale file naming a
+ * living process is looked at again after two beats, which any holder still
+ * running touches it in. Taken on the first look, listeners piled up night
+ * after night on Jacek's Mac (2026-11-19): two holding one project, and 19 of
+ * the 20 ports taken.
+ */
+async function holderOf(path, { within = STALE_MS, beat = BEAT_MS } = {}) {
+  const pid = readPid(path);
+  if (!pid || !alive(pid)) return 0;
+  if (age(path) < within) return pid;
+  const seen = touchedAt(path);
+  await new Promise((r) => setTimeout(r, beat * 2 + 250));
+  const now = readPid(path);
+  if (now !== pid) return now && alive(now) ? now : 0;
+  return alive(pid) && (touchedAt(path) !== seen || age(path) < within) ? pid : 0;
+}
+
 /** The pid holding the project's lock, other than this one, or null. */
 function lockHolder() {
   const pid = liveHolder(lockPath());
@@ -300,8 +337,9 @@ function lockHolder() {
 let keepingLock = null;
 
 /** Takes the lock when nobody alive holds it, and keeps it fresh while this runs. */
-function takeLock() {
-  if (lockHolder()) return false;
+async function takeLock() {
+  const holder = await holderOf(lockPath());
+  if (holder && holder !== process.pid) return false;
   try {
     const fd = openSync(lockPath(), 'w');
     writeSync(fd, String(process.pid));
@@ -313,6 +351,41 @@ function takeLock() {
   if (lockHolder()) return false;
   keepingLock ??= keepFresh(lockPath());
   return true;
+}
+
+/**
+ * Whether another living process holds the lock now. A holder looks every
+ * second, and gives the project up when it finds one: two of them would each
+ * pass every request on. A lock gone or naming a dead process is written
+ * again, as this one still holds the project.
+ */
+function lockLost() {
+  const pid = readPid(lockPath());
+  if (pid === process.pid) return false;
+  if (pid && alive(pid)) return true;
+  try {
+    writeFileSync(lockPath(), String(process.pid));
+  } catch { /* the next look tries again */ }
+  return false;
+}
+
+/**
+ * A listener waiting for its own project leaves this beside the lock, so a
+ * listener holding the project as another worktree's guest (followWorktrees)
+ * gives it up to the session working in it.
+ */
+function wantPath() {
+  return join(os.tmpdir(), `sharedlayers-${projectKey()}.want`);
+}
+
+function wantProject() {
+  try {
+    writeFileSync(wantPath(), String(process.pid));
+  } catch { /* a guest keeps it a little longer */ }
+}
+
+function projectWanted() {
+  return liveHolder(wantPath(), Math.max(BEAT_MS, Number(process.env.SHAREDLAYERS_LOCK_MS) || 5000) * 3) > 0;
 }
 
 function releaseLock() {
@@ -330,11 +403,15 @@ function releaseLock() {
  * (through `emit`, `serve`'s for a Claude Code session), or hands it to
  * `onNews` (`codex`, `copilot`) instead.
  */
-async function watch({ hint = null, announce = true, onNews = null, emit = (text) => process.stdout.write(text) } = {}) {
-  const said = new Set();
+async function watch({
+  hint = null, note = null, announce = true, onNews = null, said = new Set(), until = null,
+  emit = (text) => process.stdout.write(text),
+} = {}) {
   let first = true;
   let hinted = false;
   for (;;) {
+    // Given up (serve, once another holds the project): what was said stays said.
+    if (until?.()) return;
     for (const { layer } of await aiLayers()) {
       for (const comment of layer.comments) {
         if (typeof comment?.id !== 'string') continue;
@@ -350,7 +427,7 @@ async function watch({ hint = null, announce = true, onNews = null, emit = (text
           continue;
         }
         const line = requestLine(comment, status);
-        emit(`${line}${hint && !hinted ? ` ${hint}` : ''}\n`);
+        emit(`${line}${note ? ` ${note}` : ''}${hint && !hinted ? ` ${hint}` : ''}\n`);
         hinted = true;
       }
     }
@@ -435,16 +512,24 @@ function stopNow() {
   else process.exit(0);
 }
 
+/** What to do before this process stops, once each; the returned call takes it back. */
+const cleanups = new Set();
+let stopHooked = false;
 function onStop(cleanup) {
-  const stop = async () => {
-    await cleanup().catch(() => {});
-    releaseLock();
-    process.exit(0);
-  };
-  process.on('SIGINT', stop);
-  process.on('SIGTERM', stop);
-  process.on('SIGHUP', stop);
-  process.on('exit', releaseLock);
+  cleanups.add(cleanup);
+  if (!stopHooked) {
+    stopHooked = true;
+    const stop = async () => {
+      for (const c of cleanups) await c().catch(() => {});
+      releaseLock();
+      process.exit(0);
+    };
+    process.on('SIGINT', stop);
+    process.on('SIGTERM', stop);
+    process.on('SIGHUP', stop);
+    process.on('exit', releaseLock);
+  }
+  return () => cleanups.delete(cleanup);
 }
 
 /**
@@ -483,7 +568,7 @@ async function dropBeat() {
 
 /** By hand, from .sharedlayers: prints requests until stopped. */
 async function listen() {
-  if (!takeLock()) {
+  if (!(await takeLock())) {
     process.stdout.write('SharedLayers is already listening in this project (the Claude Code plugin, or another session). Nothing to start.\n');
     return;
   }
@@ -591,7 +676,16 @@ function listening(maxAge) {
   return listenCache.pending;
 }
 
-const inProject = (dir) => dir === PROJECT || dir.startsWith(PROJECT + sep);
+/**
+ * A guest listener's host: the project of the session that started it, when
+ * that is inside this folder (a session in a worktree nested in the checkout
+ * it follows). Its apps are that session's own listener's to answer for, so
+ * the extension finds one listener serving a page, not two.
+ */
+let HOST = null;
+
+const inProject = (dir) => (dir === PROJECT || dir.startsWith(PROJECT + sep))
+  && !(HOST && (dir === HOST || dir.startsWith(HOST + sep)));
 
 /** The local ports served by programs started in this project: its dev server. */
 async function servedPorts() {
@@ -717,43 +811,164 @@ async function openPort(server) {
  * The plugin's listener, one with every Claude Code session in its project,
  * started by `wake`. Silent until there is a request: a session in a project
  * without SharedLayers never hears from it. Waits, quietly, while another
- * listener holds the project, and takes over when that one stops.
+ * listener holds the project, and takes over when that one stops; gives the
+ * project up, and waits again, if another listener took it meanwhile.
  *
  * With `owner` (the Claude Code process) it ends when the session does, and
  * with `session` it writes each request line to that session's queue, which
- * the session's `wake` hook hands to Claude.
+ * the session's `wake` hook hands to Claude. While it holds the project it
+ * also listens in the project's other worktrees that have an AI layer
+ * (followWorktrees), each through a `guest` listener of its own.
  */
-async function serve(project, { owner = null, session = null } = {}) {
+async function serve(project, { owner = null, session = null, guest = null, host = null, queue: given = null } = {}) {
   // The plugin passes the project (a hook's command is given
   // ${CLAUDE_PROJECT_DIR}); by hand, it is where this runs.
   useProject(project || process.env.SHAREDLAYERS_PROJECT || process.cwd());
+  HOST = host ? real(host) : null;
   if (owner) {
     setInterval(() => {
       if (!alive(owner)) stopNow();
     }, OWNER_LOOK_MS);
   }
-  const queue = session ? sessionFile(session, 'queue') : null;
-  if (session) {
+  // A guest goes with the listener that started it.
+  if (guest) {
+    setInterval(() => {
+      if (!alive(guest)) stopNow();
+    }, OWNER_LOOK_MS);
+  }
+  const queue = given || (session ? sessionFile(session, 'queue') : null);
+  if (session && !guest) {
     // The session's wake hook starts another listener only when this one is
-    // gone from it: alive, and its file fresh (liveHolder).
-    keepFresh(sessionFile(session, 'serve'));
+    // gone from it: alive, and its file fresh (holderOf).
+    const mine = sessionFile(session, 'serve');
+    keepFresh(mine);
+    // One listener a session. One started while this one looked gone is
+    // named in the file now, and this one makes way for it.
+    setInterval(() => {
+      const named = readPid(mine);
+      if (named && named !== process.pid && alive(named)) stopNow();
+    }, BEAT_MS);
     process.on('exit', () => {
-      for (const kind of ['queue', 'offset']) rmSync(sessionFile(session, kind), { force: true });
-      if (readPid(sessionFile(session, 'serve')) === process.pid) rmSync(sessionFile(session, 'serve'), { force: true });
+      const named = readPid(mine);
+      if (named && named !== process.pid && alive(named)) return;
+      for (const kind of ['queue', 'offset', 'folders']) rmSync(sessionFile(session, kind), { force: true });
+      if (named === process.pid) rmSync(mine, { force: true });
     });
   }
   // The plugin's mark, as soon as the project has its folder (markPlugin).
   void markPlugin();
   setInterval(() => void markPlugin(), BEAT_MS);
-  await hold();
-  await watch({
-    hint: '(SharedLayers: how to handle it is in .sharedlayers/AI.md)',
-    announce: false,
-    emit: (text) => {
-      process.stdout.write(text);
-      if (queue) appendFileSync(queue, text);
-    },
+  const said = new Set();
+  // A guest's lines say where the request is: Claude works in another folder.
+  const note = guest
+    ? `(in ${PROJECT}, another worktree of this project: change the code there, and answer with node "${join(ROOT, 'ai.mjs')}" working, show, done or ask)`
+    : null;
+  const hint = `(SharedLayers: how to handle it is in ${guest ? join(ROOT, 'AI.md') : '.sharedlayers/AI.md'})`;
+  for (;;) {
+    const held = await hold({ guest: Boolean(guest) });
+    const unfollow = !guest && session && queue ? followWorktrees({ owner, session, queue }) : null;
+    await watch({
+      hint,
+      note,
+      said,
+      announce: false,
+      until: () => lockLost() || (Boolean(guest) && projectWanted()),
+      emit: (text) => {
+        process.stdout.write(text);
+        if (queue) appendFileSync(queue, text);
+      },
+    });
+    unfollow?.();
+    await held.release();
+    // A guest gives the folder up for good: to the session working in it.
+    if (guest) process.exit(0);
+  }
+}
+
+/** Whether `dir` is `root` or inside it. */
+function within(dir, root) {
+  return dir === root || dir.startsWith(root + sep);
+}
+
+/** The folders of a git repository's worktrees, the project's own among them; none outside git. */
+function gitWorktrees() {
+  return new Promise((resolve) => {
+    execFile('git', ['-C', PROJECT, 'worktree', 'list', '--porcelain'], { timeout: 5000, windowsHide: true }, (err, out) => {
+      if (err) return resolve([]);
+      resolve(String(out).split(/\r?\n/).filter((l) => l.startsWith('worktree ')).map((l) => real(l.slice(9).trim())));
+    });
   });
+}
+
+async function hasAiLayer(dir) {
+  const layers = join(dir, FOLDER, 'layers');
+  let names = [];
+  try {
+    names = await fs.readdir(layers);
+  } catch {
+    return false;
+  }
+  for (const name of names.filter((n) => n.endsWith('.json'))) {
+    try {
+      if (JSON.parse(await fs.readFile(join(layers, name), 'utf8'))?.workflow_type === 'ai') return true;
+    } catch { /* being written: the next look */ }
+  }
+  return false;
+}
+
+/**
+ * The app the person comments on may run from another worktree of the
+ * project than the one Claude Code was opened in: Jacek's Booknow overview
+ * is served from booknow-prototypes, a worktree beside the marketing checkout
+ * his session works in (2026-11-19). Its comments land in that worktree's
+ * .sharedlayers, which no session's listener looked at, so its session kept
+ * a watch going by hand, which stopped after half an hour, and with every
+ * sleep.
+ *
+ * So the project's listener also starts a listener for each other worktree
+ * with an AI layer: a guest, passing that folder's requests to this
+ * session's queue, its lines saying where they are. Only for worktrees
+ * outside the project: one inside it is served from the project, which the
+ * extension pairs its pages with already. Not where a listener holds the
+ * folder (a session working in it, or one started by hand), and a guest gives
+ * its folder up to a session opened there (wantProject). Looked at again
+ * every FOLLOW_MS. Returns the stop, which ends the guests.
+ */
+function followWorktrees({ owner, session, queue }) {
+  const guests = new Map();
+  let stopped = false;
+  const look = async () => {
+    const found = [];
+    for (const dir of await gitWorktrees()) {
+      if (!within(dir, PROJECT) && await hasAiLayer(dir)) found.push(dir);
+    }
+    if (stopped) return;
+    for (const dir of found) {
+      const child = guests.get(dir);
+      if (child && child.exitCode === null && child.signalCode === null) continue;
+      if (liveHolder(lockPathOf(dir))) continue;
+      const args = [fileURLToPath(import.meta.url), 'serve', dir, '--guest', String(process.pid), '--host', PROJECT, '--queue', queue];
+      if (owner) args.push('--owner', String(owner));
+      guests.set(dir, spawn(process.execPath, args, { stdio: 'ignore', windowsHide: true }));
+    }
+    // For the progress hook, which looks for the request being worked on.
+    try {
+      writeFileSync(sessionFile(session, 'folders'), JSON.stringify(found));
+    } catch { /* the next look */ }
+  };
+  void look();
+  const timer = setInterval(() => void look(), FOLLOW_MS);
+  const stop = () => {
+    stopped = true;
+    clearInterval(timer);
+    for (const child of guests.values()) child.kill('SIGTERM');
+    rmSync(sessionFile(session, 'folders'), { force: true });
+  };
+  const forget = onStop(async () => stop());
+  return () => {
+    forget();
+    stop();
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -786,7 +1001,10 @@ async function wake(project) {
   // shell that ran it on Windows.
   const owner = await sessionOwner();
 
-  if (!liveHolder(sessionFile(session, 'serve'))) {
+  // A hook run just after the computer woke (a turn that failed while the
+  // network was still down ends with StopFailure) finds every file stale for
+  // a moment: holderOf looks twice before starting a second listener.
+  if (!(await holderOf(sessionFile(session, 'serve')))) {
     const listener = spawn(process.execPath, [fileURLToPath(import.meta.url), 'serve', PROJECT, '--owner', String(owner), '--session', session], {
       detached: true,
       stdio: 'ignore',
@@ -796,13 +1014,18 @@ async function wake(project) {
   }
 
   const waiter = sessionFile(session, 'waiter');
-  if (liveHolder(waiter, WAITER_STALE_MS)) return;
+  if (await holderOf(waiter, { within: WAITER_STALE_MS, beat: WAKE_LOOK_MS })) return;
   writeFileSync(waiter, String(process.pid));
   keepFresh(waiter, WAKE_LOOK_MS);
   const queue = sessionFile(session, 'queue');
   const offsetFile = sessionFile(session, 'offset');
   for (;;) {
-    if (!alive(owner)) return;
+    // Ended, not just returned: the beat above would keep this running for
+    // ever, as waits of sessions long closed were on Jacek's Mac.
+    if (!alive(owner)) process.exit(0);
+    // Another wait took over, started while this one looked gone: one a session.
+    const other = readPid(waiter);
+    if (other !== process.pid && alive(other)) process.exit(0);
     let text = '';
     try {
       const all = readFileSync(queue);
@@ -825,29 +1048,43 @@ async function wake(project) {
 
 /**
  * Takes the project, waiting while another listener has it, then opens the
- * port and keeps the heartbeat going until stopped.
+ * port and keeps the heartbeat going until stopped or released. A `guest`
+ * (followWorktrees) does not take a folder a listener of its own wants.
  */
-async function hold({ waiting = null } = {}) {
+async function hold({ waiting = null, guest = false } = {}) {
   const retry = Number(process.env.SHAREDLAYERS_LOCK_MS) || 5000;
-  for (let told = false; !takeLock(); told = true) {
+  for (let told = false; ; told = true) {
+    if (!(guest && projectWanted()) && await takeLock()) break;
+    if (!guest) wantProject();
     if (!told) waiting?.();
     await new Promise((r) => setTimeout(r, retry));
   }
+  if (readPid(wantPath()) === process.pid) rmSync(wantPath(), { force: true });
   const server = http.createServer(handler());
   const port = await openPort(server);
   if (port === null) {
     process.stderr.write(`SharedLayers: every port from ${PORTS[0]} to ${PORTS[PORTS.length - 1]} is taken; the browser cannot reach this project.\n`);
   }
-  onStop(async () => {
-    server.close();
-    await dropBeat();
-  });
   // The heartbeat only where there is a folder already: no .sharedlayers is
   // made in a project that never had a comment.
-  setInterval(() => {
+  const beating = setInterval(() => {
     fs.stat(ROOT).then(() => beat(), () => {});
   }, BEAT_MS);
-  return port;
+  const release = async () => {
+    clearInterval(beating);
+    server.close();
+    server.closeAllConnections?.();
+    await dropBeat();
+    releaseLock();
+  };
+  const forget = onStop(release);
+  return {
+    port,
+    release: async () => {
+      forget();
+      await release();
+    },
+  };
 }
 
 /**
@@ -870,6 +1107,17 @@ async function context(project) {
       + 'and each comment reaches you as a line from the SharedLayers plugin ("New request <id> …"). You are listening '
       + 'already; do not start another watch. Handle each request as .sharedlayers/AI.md says: '
       + 'node .sharedlayers/ai.mjs working <id>, then show <id>, make the change, then done <id> "<what changed>" or ask <id> "<question>".');
+  }
+  // The other worktrees the listener follows (followWorktrees).
+  const others = [];
+  for (const dir of await gitWorktrees()) {
+    if (!within(dir, PROJECT) && await hasAiLayer(dir)) others.push(dir);
+  }
+  if (others.length) {
+    lines.push(`${others.length === 1 ? 'Another worktree of this project has' : 'Other worktrees of this project have'} a SharedLayers AI layer: `
+      + `${others.join(', ')}. Its requests reach you too, as lines that name the folder; you are listening there already, `
+      + 'so do not start a watch for it. Change the code in that folder, and answer with that folder\'s helper: '
+      + 'node "<folder>/.sharedlayers/ai.mjs" working <id>, show <id>, done <id> "<what changed>" or ask <id> "<question>".');
   }
   if (open) {
     lines.push(`This project has ${open} open SharedLayers comment${open === 1 ? '' : 's'} that people left on the app while it ran locally, `
@@ -1022,14 +1270,26 @@ async function progress() {
   useProject(process.env.CLAUDE_PROJECT_DIR || data.cwd || process.cwd());
   const label = toolLabel(data.tool_name, data.tool_input || {});
   if (!label) return;
+  // The project, and the other worktrees its listener follows (followWorktrees).
+  const project = PROJECT;
+  let followed = [];
+  try {
+    const session = String(data.session_id || '').replace(/[^\w-]/g, '').slice(0, 64);
+    if (session) followed = JSON.parse(readFileSync(sessionFile(session, 'folders'), 'utf8'));
+  } catch { /* none */ }
   let newest = null;
-  for (const { layer } of await aiLayers()) {
-    for (const c of layer.comments) {
-      if (c?.ai_status !== 'working' || c.is_resolved) continue;
-      if (!newest || String(c.ai_status_at || '') > String(newest.ai_status_at || '')) newest = c;
+  for (const dir of [project, ...(Array.isArray(followed) ? followed : [])]) {
+    useProject(dir);
+    for (const { layer } of await aiLayers()) {
+      for (const c of layer.comments) {
+        if (c?.ai_status !== 'working' || c.is_resolved) continue;
+        if (!newest || String(c.ai_status_at || '') > String(newest.c.ai_status_at || '')) newest = { c, dir };
+      }
     }
   }
-  if (newest) await setProgress(newest.id, label).catch(() => {});
+  if (!newest) return;
+  useProject(newest.dir);
+  await setProgress(newest.c.id, label).catch(() => {});
 }
 
 /* ------------------------------------------------------------------ */
@@ -1425,13 +1685,23 @@ function fail(message) {
 const [command, ref, ...words] = process.argv.slice(2);
 const text = words.join(' ');
 
-/** serve's --owner <pid> and --session <id>, as wake starts it. */
+/**
+ * serve's --owner <pid> and --session <id>, as wake starts it; and a guest's
+ * --guest <its listener's pid>, --host <that listener's project> and --queue
+ * <the session's queue>, as followWorktrees starts one.
+ */
 function serveOptions(args) {
   const value = (name) => {
     const i = args.indexOf(name);
     return i >= 0 ? args[i + 1] : undefined;
   };
-  return { owner: Number(value('--owner')) || null, session: value('--session') || null };
+  return {
+    owner: Number(value('--owner')) || null,
+    session: value('--session') || null,
+    guest: Number(value('--guest')) || null,
+    host: value('--host') || null,
+    queue: value('--queue') || null,
+  };
 }
 
 try {
